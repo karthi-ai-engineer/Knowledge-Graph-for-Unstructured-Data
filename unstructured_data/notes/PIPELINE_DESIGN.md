@@ -443,6 +443,31 @@ Known limitation:
 Phase 1A and Phase 1B are implemented and validated on representative ranges.
 Phase 1 as a whole is not complete until Phase 1C quality gates are implemented.
 
+### In progress: Phase 1A hybrid OCR mode
+
+Implemented `pipeline/stage1a_hybrid_parse.py` on the
+`document-parsing-phase1-hybrid` branch.
+
+The hybrid parser:
+
+- Preflights each page with PyMuPDF.
+- Selects OCR for image pages with no native text.
+- Selects OCR for low-text image pages only when image coverage is meaningful.
+- Uses native Docling parsing for all other pages.
+- Groups adjacent pages with the same mode into contiguous conversion ranges.
+- Writes per-range Docling artifacts, because merging Docling JSON refs into one
+  artificial file would require careful ref renumbering.
+- Writes a hybrid manifest and aggregate hybrid quality report.
+- Supports `--plan-only` so the OCR/native split can be reviewed before a long
+  full-document parse.
+
+For `LAKSHMIKANT.pdf`, the current full-document plan selects:
+
+```text
+pages 1-3    -> OCR
+pages 4-1407 -> native Docling parse
+```
+
 ## 10. Open decisions (need your input before implementing)
 
 - Which document(s) are we starting with — `LAKSHMIKANT.pdf` is already available

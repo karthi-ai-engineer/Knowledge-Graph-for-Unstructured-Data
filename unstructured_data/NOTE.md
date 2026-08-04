@@ -35,3 +35,13 @@ Phase 1B structural segmentation command from the workspace root:
 ```powershell
 .venv/Scripts/python.exe unstructured_data/pipeline/stage1b_structural_segment.py unstructured_data/Docs/LAKSHMIKANT.pdf unstructured_data/output/parsed/LAKSHMIKANT.p0044-p0049.docling.json
 ```
+
+Phase 1A hybrid OCR parser command from the workspace root:
+
+```powershell
+.venv/Scripts/python.exe unstructured_data/pipeline/stage1a_hybrid_parse.py unstructured_data/Docs/LAKSHMIKANT.pdf --plan-only
+```
+
+Run without `--plan-only` to execute the hybrid parse. The hybrid parser
+preflights all pages, selects OCR only for low-text image pages, and uses native
+Docling parsing for the remaining pages.
