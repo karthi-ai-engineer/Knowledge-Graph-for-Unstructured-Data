@@ -468,6 +468,272 @@ pages 1-3    -> OCR
 pages 4-1407 -> native Docling parse
 ```
 
+### Planned: Phase 1A Hybrid-VLM routing and verification
+
+The next extension is a three-method parsing pipeline, designed for pages where
+native text extraction and OCR do not preserve the information a downstream
+knowledge graph needs. It is not a plan to run a vision-language model (VLM) on
+every page. VLM processing is slower and more expensive, so it is a targeted
+fallback with an explicit audit trail.
+
+```text
+PDF page
+  -> PyMuPDF preflight router
+  -> native Docling OR OCR Docling
+  -> output verifier
+  -> accepted result OR VLM fallback OR manual-review queue
+```
+
+The intended role of each method is:
+
+- Native Docling: born-digital pages with usable embedded text, headings, and
+  extractable tables.
+- OCR Docling: scanned or rasterized pages whose main content is text.
+- VLM: visual-first or structurally complex pages where the first two methods
+  cannot reliably recover the needed meaning, such as diagrams, maps, charts,
+  image-only tables, page layouts with text embedded in figures, or pages with
+  missing/suspicious extracted content.
+
+#### Current implementation flow
+
+The flow below represents the current behavior of
+`pipeline/stage1a_hybrid_vlm_parse.py`. Solid paths are parser decisions; the
+manifest records the final path for every selected page.
+
+```mermaid
+flowchart TD
+    A[CLI command and PDF path] --> B[Load .env and environment defaults]
+    B --> C{Selected mode}
+
+    C -->|--plan-only| D[PyMuPDF preflight only]
+    D --> D1[Write route plan and manifest]
+
+    C -->|--vlm-only| E[Select every page in --page-range]
+    E --> V1[Render page to PNG]
+
+    C -->|Normal hybrid mode| F[PyMuPDF preflight for every selected page]
+    F --> G{Native text and image signals}
+    G -->|No text or low text with image| H[Initial route: OCR Docling]
+    G -->|Otherwise| I[Initial route: native Docling]
+    F --> J[Record visual-risk signals: image coverage and drawing count]
+
+    H --> K{Progress mode}
+    I --> K
+    K -->|Auto: 30 pages or fewer| L[Convert one page at a time]
+    K -->|More than 30 pages or range mode| M[Convert contiguous same-method ranges]
+    L --> N[Write Docling JSON, Markdown, page index, quality report]
+    M --> N
+
+    N --> O[Verifier reads per-page output statistics]
+    J --> O
+    O --> P{Extraction adequate?}
+    P -->|Yes| Q[Accept native or OCR as final route]
+    P -->|No: sparse visual output, no content, or OCR no text| V1
+
+    V1 --> V2{Provider selected?}
+    V2 -->|none| R[Manual review]
+    V2 -->|local| V3[OpenAI-compatible local chat endpoint]
+    V2 -->|openai| V4[Hosted OpenAI chat endpoint]
+    V3 --> V5[Validate structured VLM JSON]
+    V4 --> V5
+    V5 -->|Valid| S[Accept VLM elements as final route]
+    V5 -->|Invalid or failed| R
+
+    Q --> T[Write manifest, quality report, and parser artifacts]
+    S --> T
+    R --> T
+    T --> U[Final page provenance and review status]
+```
+
+The normal hybrid route always attempts native Docling or OCR first. The
+`--vlm-only` route is the exception: it deliberately skips both and sends every
+page in the requested range directly to the selected VLM.
+
+```mermaid
+flowchart LR
+    A[Page enters VLM] --> B[Render source PDF page to PNG]
+    B --> C[Build image plus extraction prompt]
+    C --> D{Provider}
+
+    D -->|Local qwen3 gateway| E[POST /v1/chat/completions]
+    D -->|Hosted OpenAI| F[POST /v1/chat/completions with strict JSON schema]
+
+    E --> G[Read choices 0 message content and usage]
+    F --> G
+    G --> H{JSON contains valid elements?}
+
+    H -->|Yes| I[Normalize heading, paragraph, list, table, caption, visual elements]
+    H -->|No and local retries remain| J[Send one compact JSON retry]
+    J --> E
+    H -->|No after retry or provider error| K[manual_review_required true]
+
+    I --> L[Record provider, model, endpoint, elapsed time, tokens, TPS, evidence PNG]
+    L --> M[Write VLM elements JSONL and final manifest decision]
+    K --> M
+```
+
+Key conditions in the first diagram map directly to the code:
+
+- OCR is selected for image-based pages with absent/sparse native text.
+- Native Docling is selected for the remaining pages.
+- A page becomes a VLM fallback candidate only when post-parse verification
+  finds missing/sparse output relative to visual-risk signals, or when the user
+  explicitly requests `--force-vlm-page`.
+- `--max-vlm-pages 0` removes the VLM-call cap; it does not send every page to
+  VLM unless `--vlm-only` is also supplied.
+- A malformed, timed-out, unsupported, or failed VLM result is never accepted;
+  the final route becomes `manual_review`.
+
+#### Routing signals and initial method selection
+
+A new future script, `pipeline/stage1a_hybrid_vlm_parse.py`, will retain the
+existing hybrid preflight and extend its page-level measurements. Each page
+will record at least:
+
+- `native_text_char_count`
+- `image_count` and `image_coverage`
+- `table_count` or detected table regions
+- `drawing_count` / vector-object count when available
+- page dimensions and rotation
+- warnings and output-quality signals from the selected native/OCR pass
+
+Initial routing will be conservative:
+
+- Route to `native` when embedded text is sufficient and the page has no strong
+  visual-risk signal.
+- Route to `ocr` when embedded text is absent or too sparse and image coverage
+  indicates a scanned text page.
+- Mark as `vlm_candidate` when preflight finds image-heavy visual content,
+  charts, diagrams, maps, complex tables, or a layout that is unlikely to be
+  represented by plain text and OCR alone.
+- Do not send an ambiguous page directly to VLM solely because it has an image.
+  Run the lower-cost native/OCR route first when reasonable, then let the
+  verifier decide whether VLM is justified.
+
+This separates detection from decision-making. Preflight proposes a route;
+verification decides whether its produced content is fit for use.
+
+#### Verifier and fallback policy
+
+The verifier will inspect page-level results after native/OCR parsing. It will
+not claim that extracted text is semantically perfect; it will apply
+deterministic completeness and consistency checks, backed by source-page
+signals. Its decision record will contain:
+
+```json
+{
+  "page_num": 55,
+  "initial_route": "native",
+  "final_route": "vlm",
+  "decision": "fallback_to_vlm",
+  "confidence": 0.86,
+  "accepted": false,
+  "reasons": [
+    "large_visual_region_without_description",
+    "table_region_detected_but_no_table_output"
+  ],
+  "manual_review_required": false
+}
+```
+
+Reasons that can trigger VLM fallback include:
+
+- A scanned or visual-heavy page has little or no extracted text.
+- A detected table region has no table output, an implausibly small output, or
+  failed structural extraction.
+- A large image, chart, diagram, map, or figure has no caption or visual
+  description.
+- OCR output is suspiciously sparse, repeated, garbled, or materially
+  inconsistent with the page's visual/text-area measurements.
+- Native output misses most content on a page with diagrams, text-in-image, or
+  non-linear reading order.
+
+VLM output will itself be validated for schema correctness and minimum content.
+If it fails, times out, or cannot explain the flagged visual region, the page
+will be retained in a `manual_review_required` queue. No page may silently
+disappear from the final manifest.
+
+#### VLM provider design
+
+The implementation will use a provider abstraction so the routing and verifier
+are independent of one model vendor. The default path will be local-first
+Docling VLM support, with optional OpenAI vision support enabled only through
+explicit command-line configuration and environment variables. The selected
+backend, model identifier, request status, latency, and error details will be
+written to the manifest for reproducibility and cost analysis.
+
+The provider must return structured page elements, not only free-form prose.
+Normalized VLM element types will be:
+
+```text
+heading
+paragraph
+list_item
+caption
+table
+picture_description
+chart_description
+unresolved_visual
+```
+
+Every element will retain `page_num`, `element_id`, `type`, `text`, optional
+`bbox`, `source_parser: "vlm"`, confidence, and a reference to the rendered
+page or evidence image. This keeps Phase 1B structural segmentation compatible
+with native, OCR, and VLM-derived content.
+
+#### Outputs and audit contract
+
+The Hybrid-VLM run will produce the following aggregate files in
+`output/parsed/`:
+
+```text
+<doc>.hybrid_vlm.manifest.json
+<doc>.hybrid_vlm.quality_report.json
+<doc>.hybrid_vlm.md
+```
+
+Per-method/range artifacts will follow the existing range naming convention:
+
+```text
+<doc>.hybrid_vlm.<method>.pXXXX-pYYYY.*
+```
+
+The manifest is the source of truth for page provenance. It will include page
+number, preflight signals, initial route, final route, route reason, conversion
+artifact paths, verifier decision, warnings, VLM provider/model details, and
+`manual_review_required`. Phase 1B must consume only the final accepted route
+for each page while preserving this provenance on emitted elements.
+
+#### Implementation stages and acceptance checks
+
+1. Document the architecture and finalise the provider contract before adding
+   model calls.
+2. Add the plan-only three-way router and manifest schema. Validate it on all
+   1,407 pages without invoking VLM inference.
+3. Add native/OCR verifier checks and a deterministic manual-review queue.
+4. Add a local Docling VLM adapter, then an optional OpenAI vision adapter with
+   strict structured output validation.
+5. Feed final VLM elements through Phase 1B and verify that native, OCR, and
+   VLM elements share the same provenance contract.
+
+Representative tests will cover pages 1-3 (OCR), pages 4-20 (native text),
+pages 44-49 and 55-58 (table/visual risk), a forced VLM page, VLM provider
+failure, and full-document `--plan-only`. Acceptance requires that every page
+has exactly one final route, rejected outputs are retried or explicitly queued
+for review, and VLM is used only when evidence supports the fallback.
+
+#### Research basis
+
+The plan aligns with Docling's documented VLM pipeline and page-image options,
+PyMuPDF's page image/drawing inspection APIs, and structured vision output
+patterns. Reference material:
+
+- https://docling-project.github.io/docling/examples/minimal_vlm_pipeline/
+- https://docling-project.github.io/docling/reference/pipeline_options/
+- https://pymupdf.readthedocs.io/en/latest/page.html
+- https://developers.openai.com/api/docs/guides/images-vision
+- https://developers.openai.com/api/docs/guides/structured-outputs
+
 ## 10. Open decisions (need your input before implementing)
 
 - Which document(s) are we starting with — `LAKSHMIKANT.pdf` is already available
@@ -480,6 +746,9 @@ pages 4-1407 -> native Docling parse
 - Graph storage: Neo4j (needs a running instance) vs. `networkx` in-memory
   for now?
 - Which LLM/API for extraction calls — Claude via API key you already have?
+- VLM backend policy: local Docling VLM only, OpenAI vision only, or both
+  through the proposed provider abstraction. The recommended default is both,
+  with local Docling VLM as the default and OpenAI enabled explicitly.
 - Domain-specific ontology — this PDF is Indian polity / constitutional studies,
   so the current medical/physiology ontology example must be replaced before
   extraction.

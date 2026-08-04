@@ -45,3 +45,13 @@ Phase 1A hybrid OCR parser command from the workspace root:
 Run without `--plan-only` to execute the hybrid parse. The hybrid parser
 preflights all pages, selects OCR only for low-text image pages, and uses native
 Docling parsing for the remaining pages.
+
+Phase 1A Hybrid-VLM parser command from the workspace root:
+
+```powershell
+.venv/Scripts/python.exe unstructured_data/pipeline/stage1a_hybrid_vlm_parse.py unstructured_data/Docs/LAKSHMIKANT.pdf --plan-only
+```
+
+Use `--provider local` for a configured Qwen3-VL endpoint or `--provider openai`
+for the configured OpenAI provider. Required environment variable names are in
+the root `.env.example` file.
