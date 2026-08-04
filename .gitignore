@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+unstructured_data/output/parsed/*
+!unstructured_data/output/parsed/.gitkeep
