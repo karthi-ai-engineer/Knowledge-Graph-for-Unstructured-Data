@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock
 from unittest.mock import patch
 from urllib.error import HTTPError
 
@@ -22,6 +23,7 @@ class HybridVlmTests(unittest.TestCase):
             "mixed_text_threshold": 150,
             "image_coverage_threshold": 0.5,
             "vlm_image_coverage_threshold": 0.5,
+            "direct_vlm_drawing_threshold": 200,
             "verifier_min_visual_text_chars": 80,
             "force_vlm_page": [],
             "provider": "openai",
@@ -70,6 +72,35 @@ class HybridVlmTests(unittest.TestCase):
         )
         self.assertEqual(decision["decision"], "accept")
         self.assertEqual(decision["final_route"], "native")
+
+    def test_vector_only_page_bypasses_docling_and_routes_directly_to_vlm(self):
+        page = Mock()
+        page.number = 6
+        page.get_text.return_value = ""
+        page.get_images.return_value = []
+        page.get_drawings.return_value = [{}] * 250
+        classified = hybrid_vlm.classify_vlm_page(page, self.make_args())
+        self.assertEqual(classified["mode"], "vlm")
+        self.assertEqual(classified["initial_route"], "vlm")
+        self.assertIn("vector_only_no_native_text", classified["vlm_candidate_reasons"])
+
+    def test_direct_vlm_pages_are_excluded_from_docling_execution(self):
+        plan = {
+            "pages": [
+                {"page_num": 1, "mode": "ocr"},
+                {"page_num": 2, "mode": "vlm"},
+                {"page_num": 3, "mode": "native"},
+            ],
+            "ranges": [
+                {"mode": "ocr", "start_page": 1, "end_page": 1, "page_count": 1},
+                {"mode": "vlm", "start_page": 2, "end_page": 2, "page_count": 1},
+                {"mode": "native", "start_page": 3, "end_page": 3, "page_count": 1},
+            ],
+        }
+        self.assertEqual(
+            [item["mode"] for item in hybrid_vlm.execution_items(plan, "range")],
+            ["ocr", "native"],
+        )
 
     def test_base_url_has_exactly_one_v1_path(self):
         self.assertEqual(

@@ -513,6 +513,7 @@ flowchart TD
 
     C -->|Normal hybrid mode| F[PyMuPDF preflight for every selected page]
     F --> G{Native text and image signals}
+    G -->|No text + no raster image + drawing count at least 200| V1
     G -->|No text or low text with image| H[Initial route: OCR Docling]
     G -->|Otherwise| I[Initial route: native Docling]
     F --> J[Record visual-risk signals: image coverage and drawing count]
@@ -545,9 +546,12 @@ flowchart TD
     T --> U[Final page provenance and review status]
 ```
 
-The normal hybrid route always attempts native Docling or OCR first. The
-`--vlm-only` route is the exception: it deliberately skips both and sends every
-page in the requested range directly to the selected VLM.
+The normal hybrid route attempts native Docling or OCR first, except for a
+zero-text vector-only page with no raster image and at least 200 drawings. That
+specific signature goes directly to VLM because native Docling has no text to
+recover and can spend a long time on dense vector layouts. The `--vlm-only`
+route is the other direct path: it deliberately sends every page in the
+requested range to the selected VLM.
 
 ```mermaid
 flowchart LR
@@ -576,6 +580,8 @@ Key conditions in the first diagram map directly to the code:
 
 - OCR is selected for image-based pages with absent/sparse native text.
 - Native Docling is selected for the remaining pages.
+- A zero-text vector-only page with no raster image and at least 200 drawings is
+  selected directly for VLM.
 - A page becomes a VLM fallback candidate only when post-parse verification
   finds missing/sparse output relative to visual-risk signals, or when the user
   explicitly requests `--force-vlm-page`.

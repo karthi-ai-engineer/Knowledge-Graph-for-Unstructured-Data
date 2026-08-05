@@ -1,9 +1,10 @@
 """Phase 1A - Hybrid native/OCR/VLM document parsing.
 
 Native Docling and OCR remain the default parsing routes. A vision-language
-model is invoked only for pages rejected by deterministic verification checks,
-or pages explicitly selected with --force-vlm-page. Provider credentials are
-read only from environment variables and are never written to output artifacts.
+model is invoked for pages rejected by deterministic verification checks, pages
+explicitly selected with --force-vlm-page, and vector-only pages that cannot
+provide native text. Provider credentials are read only from environment
+variables and are never written to output artifacts.
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 DEFAULT_LOCAL_MODEL = "qwen3"
 DEFAULT_VLM_MAX_TOKENS = 2600
 DEFAULT_LOCAL_RETRY_MAX_TOKENS = 5000
+DEFAULT_DIRECT_VLM_DRAWING_THRESHOLD = 200
 ELEMENT_TYPES = {
     "heading",
     "paragraph",
@@ -216,6 +218,15 @@ def parse_args() -> argparse.Namespace:
         help="Visual-risk threshold used by the verifier. Default: 0.50.",
     )
     parser.add_argument(
+        "--direct-vlm-drawing-threshold",
+        type=int,
+        default=DEFAULT_DIRECT_VLM_DRAWING_THRESHOLD,
+        help=(
+            "Send zero-text, vector-only pages directly to VLM when their drawing count reaches "
+            f"this threshold. Default: {DEFAULT_DIRECT_VLM_DRAWING_THRESHOLD}."
+        ),
+    )
+    parser.add_argument(
         "--verifier-min-visual-text-chars",
         type=int,
         default=80,
@@ -272,6 +283,14 @@ def classify_vlm_page(page: fitz.Page, args: argparse.Namespace) -> dict[str, An
     except Exception:
         drawing_count = 0
     reasons = []
+    if (
+        item["char_count"] == 0
+        and not item["has_image"]
+        and drawing_count >= args.direct_vlm_drawing_threshold
+    ):
+        item["mode"] = "vlm"
+        item["reason"] = "vector_only_no_native_text"
+        reasons.append("vector_only_no_native_text")
     if coverage >= args.vlm_image_coverage_threshold:
         reasons.append("high_image_coverage")
     if drawing_count >= 20 and item["char_count"] < args.mixed_text_threshold:
@@ -314,11 +333,13 @@ def build_plan(pdf_path: Path, args: argparse.Namespace) -> dict[str, Any]:
             "vlm_provider": args.provider,
             "vlm_model": selected_model_name(args),
             "max_vlm_pages": args.max_vlm_pages,
+            "direct_vlm_drawing_threshold": args.direct_vlm_drawing_threshold,
         },
         "page_count": len(pages),
         "native_page_count": sum(item["mode"] == "native" for item in pages),
         "ocr_page_count": sum(item["mode"] == "ocr" for item in pages),
-        "vlm_candidate_page_count": sum(item["vlm_candidate"] for item in pages),
+            "vlm_candidate_page_count": sum(item["vlm_candidate"] for item in pages),
+        "direct_vlm_page_count": sum(item["mode"] == "vlm" for item in pages),
         "ranges": pages_to_ranges(pages),
         "pages": pages,
     }
@@ -332,7 +353,7 @@ def resolve_progress_mode(plan: dict[str, Any], args: argparse.Namespace) -> str
 
 def execution_items(plan: dict[str, Any], progress_mode: str) -> list[dict[str, Any]]:
     if progress_mode == "range":
-        return list(plan["ranges"])
+        return [item for item in plan["ranges"] if item["mode"] in {"native", "ocr"}]
     return [
         {
             "mode": page["mode"],
@@ -341,6 +362,7 @@ def execution_items(plan: dict[str, Any], progress_mode: str) -> list[dict[str, 
             "page_count": 1,
         }
         for page in plan["pages"]
+        if page["mode"] in {"native", "ocr"}
     ]
 
 
@@ -915,6 +937,19 @@ def verify_conversions(plan: dict[str, Any], conversions: list[dict[str, Any]], 
     decisions = []
     forced = set(args.force_vlm_page)
     for page in plan["pages"]:
+        if page["mode"] == "vlm":
+            decisions.append({
+                "page_num": page["page_num"],
+                "initial_route": "vlm",
+                "final_route": "vlm_direct",
+                "decision": "fallback_to_vlm",
+                "accepted": False,
+                "confidence": 0.0,
+                "reasons": page["vlm_candidate_reasons"],
+                "output_stats": {},
+                "manual_review_required": False,
+            })
+            continue
         decision = verify_page(page, stats.get(page["page_num"], {
             "text_chars": 0, "text_element_count": 0, "table_count": 0, "picture_count": 0,
         }), args)
@@ -937,7 +972,10 @@ def apply_vlm(
         page_num = decision["page_num"]
         if args.provider == "none":
             decision.update({"decision": "manual_review", "final_route": "manual_review", "manual_review_required": True})
-            print(f"Page {page_num}: verifier requested VLM, but no provider was selected; manual review.")
+            if decision["initial_route"] == "vlm":
+                print(f"Page {page_num}: direct VLM route requires a provider; manual review.")
+            else:
+                print(f"Page {page_num}: verifier requested VLM, but no provider was selected; manual review.")
             continue
         if index >= allowed:
             decision.update({
@@ -1024,8 +1062,15 @@ def main() -> None:
             )
             print(f"Local chat response: {result['content']}")
         return
-    if args.max_vlm_pages < 0 or args.vlm_image_dpi < 72:
-        raise ValueError("--max-vlm-pages must be non-negative and --vlm-image-dpi must be at least 72.")
+    if (
+        args.max_vlm_pages < 0
+        or args.vlm_image_dpi < 72
+        or args.direct_vlm_drawing_threshold < 0
+    ):
+        raise ValueError(
+            "--max-vlm-pages and --direct-vlm-drawing-threshold must be non-negative, "
+            "and --vlm-image-dpi must be at least 72."
+        )
     if args.provider == "local" and not args.plan_only:
         validate_local_gateway(args)
     output_dir = resolve_output_dir(args.pdf_path, args.output_dir)
@@ -1072,8 +1117,15 @@ def main() -> None:
             completed_pages = 0
             print(
                 f"Processing {plan['page_count']} pages with {progress_mode}-level progress "
-                f"(native={plan['native_page_count']}, OCR={plan['ocr_page_count']})."
+                f"(native={plan['native_page_count']}, OCR={plan['ocr_page_count']}, "
+                f"direct VLM={plan['direct_vlm_page_count']})."
             )
+            for page in plan["pages"]:
+                if page["mode"] == "vlm":
+                    print(
+                        f"Page {page['page_num']}: VLM selected during preflight "
+                        f"({', '.join(page['vlm_candidate_reasons'])})."
+                    )
             for item in items:
                 page_label = (
                     f"Page {item['start_page']}"
@@ -1097,6 +1149,11 @@ def main() -> None:
                     if decision["decision"] == "accept":
                         print(
                             f"Page {decision['page_num']}: {decision['initial_route'].upper()} accepted."
+                        )
+                    elif decision["initial_route"] == "vlm":
+                        print(
+                            f"Page {decision['page_num']}: direct VLM route retained "
+                            f"({', '.join(decision['reasons'])})."
                         )
                     else:
                         print(
