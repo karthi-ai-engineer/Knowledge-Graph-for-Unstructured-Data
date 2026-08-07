@@ -109,7 +109,19 @@ def chunk_elements(
 
     for el in elements:
         text = el.get("text", "").strip()
-        if not text:
+        
+        # If it's a table, serialize the rows into a readable format
+        if el.get("type") == "table" and "rows" in el:
+            table_text = []
+            if text:
+                table_text.append(f"Table Caption: {text}")
+            for row in el.get("rows", []):
+                # Clean up empty cells and join with pipes
+                cleaned_row = [str(cell).strip() if cell else "" for cell in row]
+                table_text.append(" | ".join(cleaned_row))
+            text = "\n".join(table_text)
+            
+        if not text.strip():
             continue
             
         el_tokens = len(tokenizer.encode(text))
