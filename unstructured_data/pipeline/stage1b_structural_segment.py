@@ -31,12 +31,12 @@ def parse_args() -> argparse.Namespace:
         description="Build sections.json and elements.jsonl from Docling output."
     )
     parser.add_argument("pdf_path", type=Path)
-    parser.add_argument("docling_json_path", type=Path)
+    parser.add_argument("input_dir", type=Path, help="Directory containing Phase 1A outputs")
     parser.add_argument(
         "output_dir",
         nargs="?",
         type=Path,
-        help="Defaults to the Docling JSON file's directory.",
+        help="Defaults to the input directory.",
     )
     return parser.parse_args()
 
@@ -44,6 +44,15 @@ def parse_args() -> argparse.Namespace:
 def read_json(path: Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    data = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                data.append(json.loads(line))
+    return data
 
 
 def write_json(path: Path, data: dict[str, Any] | list[dict[str, Any]]) -> None:
@@ -203,6 +212,90 @@ def load_outline_sections(pdf_path: Path) -> tuple[list[dict[str, Any]], int]:
     return sections, page_count
 
 
+def build_sections_from_docling_headings(
+    elements: list[dict[str, Any]],
+    document_title: str,
+    page_count: int,
+) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = [
+        {
+            "section_id": "document",
+            "title": document_title,
+            "level": 0,
+            "parent_id": None,
+            "parent_title": None,
+            "start_page": 1,
+            "end_page": page_count,
+            "source": "synthetic_root",
+            "confidence": 1.0,
+            "outline_level": 0,
+            "order": 0,
+            "kind": "document",
+        }
+    ]
+
+    stack: dict[int, dict[str, Any]] = {0: sections[0]}
+    occurrences: dict[str, int] = {}
+    
+    headings = [e for e in elements if e["type"] == "heading"]
+    if not headings:
+        return sections
+        
+    seen_main_part = False
+    order = 1
+    for heading in headings:
+        title = heading.get("text", "").strip()
+        if not title:
+            continue
+            
+        docling_level = heading.get("docling_level") or 1
+        kind, inferred_level = infer_outline_kind_and_level(title, seen_main_part)
+        if kind == "part":
+            seen_main_part = True
+            
+        # Use Docling's explicitly assigned level if available
+        level = docling_level
+        
+        occurrences[kind] = occurrences.get(kind, 0) + 1
+        
+        parent_level = level - 1
+        while parent_level > 0 and parent_level not in stack:
+            parent_level -= 1
+        parent = stack.get(parent_level, sections[0])
+        
+        section = {
+            "section_id": make_section_id(title, kind, occurrences[kind]),
+            "title": title,
+            "level": level,
+            "parent_id": parent["section_id"],
+            "parent_title": parent["title"],
+            "start_page": max(1, min(int(heading.get("page_num") or 1), page_count)),
+            "end_page": page_count,
+            "source": "docling_heading",
+            "confidence": 0.8,
+            "outline_level": level,
+            "order": order,
+            "kind": kind,
+        }
+        sections.append(section)
+        stack[level] = section
+        
+        for l in list(stack.keys()):
+            if l > level:
+                del stack[l]
+        order += 1
+        
+    for index, section in enumerate(sections):
+        end_page = page_count
+        for next_section in sections[index + 1 :]:
+            if next_section["level"] <= section["level"]:
+                end_page = max(section["start_page"], next_section["start_page"] - 1)
+                break
+        section["end_page"] = end_page
+        
+    return sections
+
+
 def ref_id(ref: dict[str, Any] | str | None) -> str | None:
     if ref is None:
         return None
@@ -309,6 +402,7 @@ def make_base_element(
         "order": order,
         "source_parser": "docling",
         "source_label": item.get("label"),
+        "docling_level": item.get("level"),
     }
 
 
@@ -443,7 +537,8 @@ def build_report(
     if unassigned:
         warnings.append("Some elements only matched the synthetic document root.")
     if not any(section["source"] == "pdf_outline" for section in sections):
-        warnings.append("No PDF outline sections were found.")
+        if not any(section["source"] == "docling_heading" for section in sections):
+            warnings.append("No PDF outline sections or Docling headings were found.")
 
     return {
         "source_file": str(pdf_path),
@@ -451,6 +546,7 @@ def build_report(
         "pdf_page_count": page_count,
         "section_count": len(sections),
         "outline_section_count": sum(1 for section in sections if section["source"] == "pdf_outline"),
+        "docling_heading_section_count": sum(1 for section in sections if section["source"] == "docling_heading"),
         "element_count": len(elements),
         "element_page_count": len(pages),
         "element_type_counts": type_counts,
@@ -464,33 +560,56 @@ def main() -> None:
     args = parse_args()
     if not args.pdf_path.exists():
         raise FileNotFoundError(args.pdf_path)
-    if not args.docling_json_path.exists():
-        raise FileNotFoundError(args.docling_json_path)
+    if not args.input_dir.exists():
+        raise FileNotFoundError(args.input_dir)
 
-    output_dir = args.output_dir or args.docling_json_path.parent
+    output_dir = args.output_dir or args.input_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    docling_dict = read_json(args.docling_json_path)
+    pdf_stem = args.pdf_path.stem
     sections, page_count = load_outline_sections(args.pdf_path)
-    elements = flatten_docling_elements(docling_dict)
+    
+    # Load all docling elements for this PDF
+    elements = []
+    docling_files = list(args.input_dir.glob(f"{pdf_stem}.*.docling.json"))
+    for df in docling_files:
+        docling_dict = read_json(df)
+        elements.extend(flatten_docling_elements(docling_dict))
+    
+    # Load VLM elements for this PDF (these can be orphans with no docling equivalent)
+    vlm_path = args.input_dir / f"{pdf_stem}.hybrid_vlm.vlm_elements.jsonl"
+    if vlm_path.exists():
+        vlm_elements = read_jsonl(vlm_path)
+        elements.extend(vlm_elements)
+    
+    # Sort elements chronologically by page number and order
+    elements.sort(key=lambda e: (e.get("page_num") or 0, e.get("order") or 0))
+
+    # Fallback to Docling headings if PDF outline is absent/sparse
+    if len(sections) <= 2 and not any(s["source"] == "pdf_outline" for s in sections):
+        sections = build_sections_from_docling_headings(elements, args.pdf_path.stem, page_count)
+        
     attach_sections(elements, sections)
 
-    stem = output_stem(args.docling_json_path)
-    sections_path = output_dir / f"{stem}.sections.json"
-    elements_path = output_dir / f"{stem}.elements.jsonl"
+    stem = f"{pdf_stem}.hybrid_vlm"
+    sections_path = output_dir / f"{stem}.document.sections.json"
+    elements_path = output_dir / f"{stem}.document.elements.jsonl"
     report_path = output_dir / f"{stem}.segmentation_report.json"
 
     write_json(sections_path, sections)
     write_jsonl(elements_path, elements)
+    
+    report_data = build_report(
+        pdf_path=args.pdf_path,
+        docling_json_path=docling_files[0] if docling_files else args.input_dir,
+        sections=sections,
+        elements=elements,
+        page_count=page_count,
+    )
+    report_data["docling_files_processed"] = len(docling_files)
     write_json(
         report_path,
-        build_report(
-            pdf_path=args.pdf_path,
-            docling_json_path=args.docling_json_path,
-            sections=sections,
-            elements=elements,
-            page_count=page_count,
-        ),
+        report_data,
     )
 
     print(f"Sections:       {len(sections)}")
