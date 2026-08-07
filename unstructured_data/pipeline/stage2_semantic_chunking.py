@@ -116,8 +116,8 @@ def chunk_elements(
             if text:
                 table_text.append(f"Table Caption: {text}")
             for row in el.get("rows", []):
-                # Clean up empty cells and join with pipes
-                cleaned_row = [str(cell).strip() if cell else "" for cell in row]
+                # Clean up empty cells, remove newlines, escape pipes, and join with pipes
+                cleaned_row = [str(cell).strip().replace("\n", " ").replace("\r", "").replace("|", "\\|") if cell else "" for cell in row]
                 table_text.append(" | ".join(cleaned_row))
             text = "\n".join(table_text)
             
